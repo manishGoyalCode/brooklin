@@ -277,38 +277,186 @@ public class TestEventProducer {
 
   private static final String SLA_WITHIN_AGG = "EventProducer.aggregate.eventsProducedWithinSla";
   private static final String SLA_WITHIN_ALT_AGG = "EventProducer.aggregate.eventsProducedWithinAlternateSla";
+  private static final String COMMIT_WITHIN_AGG = "EventProducer.aggregate.eventsCommitWithinSla";
+  private static final String COMMIT_OUTSIDE_AGG = "EventProducer.aggregate.eventsCommitOutsideSla";
 
-  @Test
-  public void testSlaGraceActiveForNewCdcStream() {
-    // CDC source (single-slash mysql:/) + freshly-created stream → grace gate engaged. Both
-    // primary and alternate SLA counter pairs are suppressed entirely.
-    Datastream datastream = DatastreamTestUtils.createDatastreams(DummyConnector.CONNECTOR_TYPE, "ds-cdc-new")[0];
-    datastream.getSource().setConnectionString("mysql:/myhost/testDatabase/myTable");
-    datastream.getMetadata().put(DatastreamMetadataConstants.CREATION_MS,
-        String.valueOf(System.currentTimeMillis()));
-    sendOneEventThroughProducer(datastream, new Properties());
-
-    DynamicMetricsManager metrics = DynamicMetricsManager.getInstance();
-    Assert.assertNull(metrics.getMetric(SLA_WITHIN_AGG),
-        "Primary withinSla counter must not be created during grace period for new CDC stream");
-    Assert.assertNull(metrics.getMetric(SLA_WITHIN_ALT_AGG),
-        "Alternate-SLA counter must not be created during grace period for new CDC stream");
+  // For commit-to-ack metric assertions, use a non-CDC source (kafka://) so the grace gate is not
+  // engaged — the new metric should fire whenever the connector supplies a commit timestamp,
+  // regardless of CDC catch-up logic.
+  private static String setupOldNonCdcStream(Datastream datastream) {
+    datastream.getSource().setConnectionString("kafka://broker:9092/topic");
+    long oneHourAgo = System.currentTimeMillis() - (60 * 60 * 1000L);
+    datastream.getMetadata().put(DatastreamMetadataConstants.CREATION_MS, String.valueOf(oneHourAgo));
+    return datastream.getName();
   }
 
   @Test
-  public void testSlaGraceExpiredForOldCdcStream() {
-    // CDC source + creation timestamp older than the 2h default grace window → SLA reporting active.
-    Datastream datastream = DatastreamTestUtils.createDatastreams(DummyConnector.CONNECTOR_TYPE, "ds-cdc-old")[0];
+  public void testCommitToAckMetricNotEmittedWhenCommitTimestampAbsent() {
+    // No commit timestamp on the record → new metric path is a no-op; existing metrics are unaffected.
+    Datastream datastream = DatastreamTestUtils.createDatastreams(DummyConnector.CONNECTOR_TYPE, "ds-no-commit-ts")[0];
+    setupOldNonCdcStream(datastream);
+
+    String topic = "noCommitTsTopic";
+    DatastreamTaskImpl task = new DatastreamTaskImpl(Collections.singletonList(datastream));
+    sendOneEventThroughTask(task, new Properties(), topic, null);
+
+    DynamicMetricsManager metrics = DynamicMetricsManager.getInstance();
+    Assert.assertNull(
+        metrics.getMetric("EventProducer." + topic + "." + EventProducer.EVENTS_COMMIT_TO_ACK_LATENCY_MS_STRING),
+        "commit-to-ack histogram must not fire when the record has no commit timestamp");
+    Assert.assertNull(metrics.getMetric(COMMIT_WITHIN_AGG),
+        "commit-to-ack within-SLA counter must not be created when no commit timestamp is supplied");
+    Assert.assertNull(metrics.getMetric(COMMIT_OUTSIDE_AGG),
+        "commit-to-ack outside-SLA counter must not be created when no commit timestamp is supplied");
+    Assert.assertNotNull(metrics.getMetric(SLA_WITHIN_AGG),
+        "existing eventsLatencyMs SLA path must still fire — no regression");
+  }
+
+  @Test
+  public void testCommitToAckMetricFiresWithinSlaWhenCommitTimestampRecent() {
+    // Recent commit timestamp → within default 5-min SLA → withinSla counter increments, histogram emits.
+    Datastream datastream = DatastreamTestUtils.createDatastreams(DummyConnector.CONNECTOR_TYPE, "ds-commit-within")[0];
+    setupOldNonCdcStream(datastream);
+
+    String topic = "commitWithinSlaTopic";
+    DatastreamTaskImpl task = new DatastreamTaskImpl(Collections.singletonList(datastream));
+    sendOneEventThroughTask(task, new Properties(), topic, System.currentTimeMillis());
+
+    DynamicMetricsManager metrics = DynamicMetricsManager.getInstance();
+    Assert.assertNotNull(
+        metrics.getMetric("EventProducer." + topic + "." + EventProducer.EVENTS_COMMIT_TO_ACK_LATENCY_MS_STRING),
+        "commit-to-ack histogram must fire when commit timestamp is present");
+    Counter withinAgg = (Counter) metrics.getMetric(COMMIT_WITHIN_AGG);
+    Assert.assertNotNull(withinAgg, "withinSla aggregate counter must be created when commit timestamp is present");
+    Assert.assertEquals(withinAgg.getCount(), 1L, "recent commit timestamp should fall inside the default 5-min SLA");
+  }
+
+  @Test
+  public void testCommitToAckMetricFiresOutsideSlaWhenThresholdTight() {
+    // Force OUTSIDE_SLA by setting a 1ms threshold; any latency by the time the callback runs blows past it.
+    Datastream datastream = DatastreamTestUtils.createDatastreams(DummyConnector.CONNECTOR_TYPE, "ds-commit-outside")[0];
+    setupOldNonCdcStream(datastream);
+
+    Properties props = new Properties();
+    props.put("commitToAckThresholdSlaMs", "1");
+
+    String topic = "commitOutsideSlaTopic";
+    DatastreamTaskImpl task = new DatastreamTaskImpl(Collections.singletonList(datastream));
+    sendOneEventThroughTask(task, props, topic, System.currentTimeMillis() - 100);
+
+    DynamicMetricsManager metrics = DynamicMetricsManager.getInstance();
+    Counter outsideAgg = (Counter) metrics.getMetric(COMMIT_OUTSIDE_AGG);
+    Assert.assertNotNull(outsideAgg, "outsideSla counter must be created when commit-to-ack latency exceeds threshold");
+    Assert.assertEquals(outsideAgg.getCount(), 1L,
+        "100ms commit-to-ack latency vs 1ms threshold should count as outside-SLA");
+  }
+
+  @Test
+  public void testCommitToAckMetricRedirectedToSlaIneligibleDuringGracePeriod() {
+    // CDC+BST source + freshly created stream → grace gate engaged. Commit-to-ack histogram should redirect
+    // to the SLA-ineligible variant and both within/outside counters should remain suppressed —
+    // same suppression semantics as the existing eventsLatencyMs path.
+    Datastream datastream = DatastreamTestUtils.createDatastreams(DummyConnector.CONNECTOR_TYPE, "ds-cdc-commit-grace")[0];
+    datastream.getSource().setConnectionString("mysql:/myhost/testDatabase/myTable");
+    datastream.getMetadata().put(DatastreamMetadataConstants.CREATION_MS,
+        String.valueOf(System.currentTimeMillis()));
+    datastream.getMetadata().put(DatastreamMetadataConstants.CDC_BOOTSTRAP_REQUIRED_KEY, "true");
+
+    Properties props = new Properties();
+    props.put("newStreamGracePeriodMs", "7200000");
+
+    String topic = "commitGraceTopic";
+    DatastreamTaskImpl task = new DatastreamTaskImpl(Collections.singletonList(datastream));
+    sendOneEventThroughTask(task, props, topic, System.currentTimeMillis());
+
+    DynamicMetricsManager metrics = DynamicMetricsManager.getInstance();
+    Assert.assertNull(
+        metrics.getMetric("EventProducer." + topic + "." + EventProducer.EVENTS_COMMIT_TO_ACK_LATENCY_MS_STRING),
+        "commit-to-ack histogram must NOT fire during grace period");
+    Assert.assertNotNull(
+        metrics.getMetric(
+            "EventProducer." + topic + "." + EventProducer.EVENTS_COMMIT_TO_ACK_LATENCY_MS_SLA_INELIGIBLE_STRING),
+        "commit-to-ack latency should be redirected to the SLA-ineligible histogram during grace");
+    Assert.assertNull(metrics.getMetric(COMMIT_WITHIN_AGG),
+        "commit-to-ack withinSla counter must remain suppressed during grace");
+    Assert.assertNull(metrics.getMetric(COMMIT_OUTSIDE_AGG),
+        "commit-to-ack outsideSla counter must remain suppressed during grace");
+  }
+
+  @Test
+  public void testSlaGraceActiveForNewCdcBstStream() {
+    // CDC+BST source (single-slash mysql:/ + cdcBootstrapRequired=true) + freshly-created stream
+    // → grace gate engaged. Both primary and alternate SLA counter pairs are suppressed entirely.
+    Datastream datastream = DatastreamTestUtils.createDatastreams(DummyConnector.CONNECTOR_TYPE, "ds-cdc-bst-new")[0];
+    datastream.getSource().setConnectionString("mysql:/myhost/testDatabase/myTable");
+    datastream.getMetadata().put(DatastreamMetadataConstants.CREATION_MS,
+        String.valueOf(System.currentTimeMillis()));
+    datastream.getMetadata().put(DatastreamMetadataConstants.CDC_BOOTSTRAP_REQUIRED_KEY, "true");
+    Properties props = new Properties();
+    props.put("newStreamGracePeriodMs", "7200000"); // explicit 2h grace period
+    sendOneEventThroughProducer(datastream, props);
+
+    DynamicMetricsManager metrics = DynamicMetricsManager.getInstance();
+    Assert.assertNull(metrics.getMetric(SLA_WITHIN_AGG),
+        "Primary withinSla counter must not be created during grace period for new CDC+BST stream");
+    Assert.assertNull(metrics.getMetric(SLA_WITHIN_ALT_AGG),
+        "Alternate-SLA counter must not be created during grace period for new CDC+BST stream");
+  }
+
+  @Test
+  public void testSlaGraceNotAppliedToCdcOnlyStream() {
+    // Pure CDC-only source (no cdcBootstrapRequired flag) → isCdcSource() returns false →
+    // grace gate never engaged, SLA is reported from the very first event regardless of stream age.
+    Datastream datastream = DatastreamTestUtils.createDatastreams(DummyConnector.CONNECTOR_TYPE, "ds-cdc-only")[0];
+    datastream.getSource().setConnectionString("mysql:/myhost/testDatabase/myTable");
+    datastream.getMetadata().put(DatastreamMetadataConstants.CREATION_MS,
+        String.valueOf(System.currentTimeMillis()));
+    // Intentionally NOT setting cdcBootstrapRequired — this is a pure CDC-only stream
+    Properties props = new Properties();
+    props.put("newStreamGracePeriodMs", "7200000");
+    sendOneEventThroughProducer(datastream, props);
+
+    DynamicMetricsManager metrics = DynamicMetricsManager.getInstance();
+    Counter withinAgg = (Counter) metrics.getMetric(SLA_WITHIN_AGG);
+    Assert.assertNotNull(withinAgg,
+        "Pure CDC-only streams must report SLA immediately — grace suppression only applies to CDC+BST");
+    Assert.assertEquals(withinAgg.getCount(), 1L);
+  }
+
+  @Test
+  public void testSlaGraceNotAppliedToCdcOnlyStreamWithFalseFlag() {
+    // CDC source with cdcBootstrapRequired=false → same as no flag; SLA always reported.
+    Datastream datastream = DatastreamTestUtils.createDatastreams(DummyConnector.CONNECTOR_TYPE, "ds-cdc-false")[0];
+    datastream.getSource().setConnectionString("mysql:/myhost/testDatabase/myTable");
+    datastream.getMetadata().put(DatastreamMetadataConstants.CREATION_MS,
+        String.valueOf(System.currentTimeMillis()));
+    datastream.getMetadata().put(DatastreamMetadataConstants.CDC_BOOTSTRAP_REQUIRED_KEY, "false");
+    Properties props = new Properties();
+    props.put("newStreamGracePeriodMs", "7200000");
+    sendOneEventThroughProducer(datastream, props);
+
+    DynamicMetricsManager metrics = DynamicMetricsManager.getInstance();
+    Counter withinAgg = (Counter) metrics.getMetric(SLA_WITHIN_AGG);
+    Assert.assertNotNull(withinAgg,
+        "cdcBootstrapRequired=false must not suppress SLA — flag must be explicitly true");
+    Assert.assertEquals(withinAgg.getCount(), 1L);
+  }
+
+  @Test
+  public void testSlaGraceExpiredForOldCdcBstStream() {
+    // CDC+BST source + creation timestamp older than the 2h grace window → SLA reporting active.
+    Datastream datastream = DatastreamTestUtils.createDatastreams(DummyConnector.CONNECTOR_TYPE, "ds-cdc-bst-old")[0];
     datastream.getSource().setConnectionString("mysql:/myhost/testDatabase/myTable");
     long threeHoursAgo = System.currentTimeMillis() - (3 * 60 * 60 * 1000L);
     datastream.getMetadata().put(DatastreamMetadataConstants.CREATION_MS, String.valueOf(threeHoursAgo));
+    datastream.getMetadata().put(DatastreamMetadataConstants.CDC_BOOTSTRAP_REQUIRED_KEY, "true");
     sendOneEventThroughProducer(datastream, new Properties());
 
     DynamicMetricsManager metrics = DynamicMetricsManager.getInstance();
     Counter withinAgg = (Counter) metrics.getMetric(SLA_WITHIN_AGG);
-    Assert.assertNotNull(withinAgg, "withinSla counter must be created once grace period has expired");
+    Assert.assertNotNull(withinAgg, "withinSla counter must be created once CDC+BST grace period has expired");
     Assert.assertEquals(withinAgg.getCount(), 1L,
-        "Single send with fresh source timestamp should be reported as within SLA");
+        "Single send past grace window should be reported as within SLA");
   }
 
   @Test
@@ -329,12 +477,13 @@ public class TestEventProducer {
 
   @Test
   public void testSlaGraceFailsOpenWhenCreationMsMissing() {
-    // CDC source but no CREATION_MS metadata → _streamCreationTimeMs stays 0 → gate disabled (fail-open).
+    // CDC+BST source but no CREATION_MS metadata → _streamCreationTimeMs stays 0 → gate disabled (fail-open).
     // Note: DatastreamTestUtils.createDatastreams auto-populates CREATION_MS, so we explicitly remove
     // it to exercise the missing-metadata path.
     Datastream datastream = DatastreamTestUtils.createDatastreams(DummyConnector.CONNECTOR_TYPE, "ds-cdc-nomd")[0];
     datastream.getSource().setConnectionString("mysql:/myhost/testDatabase/myTable");
     datastream.getMetadata().remove(DatastreamMetadataConstants.CREATION_MS);
+    datastream.getMetadata().put(DatastreamMetadataConstants.CDC_BOOTSTRAP_REQUIRED_KEY, "true");
     sendOneEventThroughProducer(datastream, new Properties());
 
     DynamicMetricsManager metrics = DynamicMetricsManager.getInstance();
@@ -344,10 +493,11 @@ public class TestEventProducer {
 
   @Test
   public void testSlaGraceFailsOpenWhenCreationMsMalformed() {
-    // Malformed CREATION_MS → NumberFormatException caught in constructor → grace disabled.
+    // CDC+BST source with malformed CREATION_MS → NumberFormatException caught in constructor → grace disabled.
     Datastream datastream = DatastreamTestUtils.createDatastreams(DummyConnector.CONNECTOR_TYPE, "ds-cdc-bad")[0];
     datastream.getSource().setConnectionString("mysql:/myhost/testDatabase/myTable");
     datastream.getMetadata().put(DatastreamMetadataConstants.CREATION_MS, "not-a-long");
+    datastream.getMetadata().put(DatastreamMetadataConstants.CDC_BOOTSTRAP_REQUIRED_KEY, "true");
     sendOneEventThroughProducer(datastream, new Properties());
 
     DynamicMetricsManager metrics = DynamicMetricsManager.getInstance();
@@ -357,16 +507,20 @@ public class TestEventProducer {
 
   @Test
   public void testLatencyHistogramRedirectedToSlaIneligibleDuringGracePeriod() {
-    // During grace, the lag histogram is redirected from eventsLatencyMs to eventsLatencyMsSlaIneligible
-    // so lag alerts on the primary metric do not fire on initial CDC catch-up. Both primary and
-    // alternate SLA counters are suppressed entirely during the grace window.
+    // During CDC+BST grace, the lag histogram is redirected from eventsLatencyMs to
+    // eventsLatencyMsSlaIneligible so lag alerts on the primary metric do not fire on initial
+    // CDC+BST catch-up. Both primary and alternate SLA counters are suppressed entirely during
+    // the grace window.
     Datastream datastream = DatastreamTestUtils.createDatastreams(DummyConnector.CONNECTOR_TYPE, "ds-cdc-latency")[0];
     datastream.getSource().setConnectionString("mysql:/myhost/testDatabase/myTable");
     datastream.getMetadata().put(DatastreamMetadataConstants.CREATION_MS,
         String.valueOf(System.currentTimeMillis()));
+    datastream.getMetadata().put(DatastreamMetadataConstants.CDC_BOOTSTRAP_REQUIRED_KEY, "true");
 
+    Properties props = new Properties();
+    props.put("newStreamGracePeriodMs", "7200000"); // explicit 2h grace period
     String someTopicName = "graceLatencyTopic";
-    sendOneEventThroughProducer(datastream, new Properties(), someTopicName);
+    sendOneEventThroughProducer(datastream, props, someTopicName);
 
     DynamicMetricsManager metrics = DynamicMetricsManager.getInstance();
     Assert.assertNull(
@@ -383,11 +537,12 @@ public class TestEventProducer {
 
   @Test
   public void testLatencyHistogramFiresOnPrimaryAfterGracePeriod() {
-    // Post-grace: latency observations go back to eventsLatencyMs (the metric lag alerts watch).
+    // Post-grace CDC+BST: latency observations go back to eventsLatencyMs (the metric lag alerts watch).
     Datastream datastream = DatastreamTestUtils.createDatastreams(DummyConnector.CONNECTOR_TYPE, "ds-cdc-latency-old")[0];
     datastream.getSource().setConnectionString("mysql:/myhost/testDatabase/myTable");
     long threeHoursAgo = System.currentTimeMillis() - (3 * 60 * 60 * 1000L);
     datastream.getMetadata().put(DatastreamMetadataConstants.CREATION_MS, String.valueOf(threeHoursAgo));
+    datastream.getMetadata().put(DatastreamMetadataConstants.CDC_BOOTSTRAP_REQUIRED_KEY, "true");
 
     String someTopicName = "postGraceLatencyTopic";
     sendOneEventThroughProducer(datastream, new Properties(), someTopicName);
@@ -403,12 +558,13 @@ public class TestEventProducer {
 
   @Test
   public void testCustomGracePeriodOverride() {
-    // Operator-specified grace period should win over the 2h default. With a 1ms window, a stream
+    // Operator-specified grace period should win over the default. With a 1ms window, a CDC+BST stream
     // created "now" should already be past grace by the time the producer records its first event.
     Datastream datastream = DatastreamTestUtils.createDatastreams(DummyConnector.CONNECTOR_TYPE, "ds-cdc-custom")[0];
     datastream.getSource().setConnectionString("mysql:/myhost/testDatabase/myTable");
     datastream.getMetadata().put(DatastreamMetadataConstants.CREATION_MS,
         String.valueOf(System.currentTimeMillis() - 10));
+    datastream.getMetadata().put(DatastreamMetadataConstants.CDC_BOOTSTRAP_REQUIRED_KEY, "true");
 
     Properties props = new Properties();
     props.put("newStreamGracePeriodMs", "1");
@@ -421,7 +577,7 @@ public class TestEventProducer {
 
   @Test
   public void testSlaGraceDedupedTaskUsesOldestCreationTime() {
-    // Two CDC datastreams deduped onto one task: one created 3h ago, one created now.
+    // Two CDC+BST datastreams deduped onto one task: one created 3h ago, one created now.
     // Grace gate must follow the OLDEST stream (3h ago, past grace) → SLA reporting active.
     long now = System.currentTimeMillis();
     long threeHoursAgo = now - (3 * 60 * 60 * 1000L);
@@ -429,10 +585,12 @@ public class TestEventProducer {
     Datastream oldDs = DatastreamTestUtils.createDatastreams(DummyConnector.CONNECTOR_TYPE, "ds-old")[0];
     oldDs.getSource().setConnectionString("mysql:/myhost/testDatabase/myTable");
     oldDs.getMetadata().put(DatastreamMetadataConstants.CREATION_MS, String.valueOf(threeHoursAgo));
+    oldDs.getMetadata().put(DatastreamMetadataConstants.CDC_BOOTSTRAP_REQUIRED_KEY, "true");
 
     Datastream newDs = DatastreamTestUtils.createDatastreams(DummyConnector.CONNECTOR_TYPE, "ds-new")[0];
     newDs.getSource().setConnectionString("mysql:/myhost/testDatabase/myTable");
     newDs.getMetadata().put(DatastreamMetadataConstants.CREATION_MS, String.valueOf(now));
+    newDs.getMetadata().put(DatastreamMetadataConstants.CDC_BOOTSTRAP_REQUIRED_KEY, "true");
 
     DatastreamTaskImpl task = new DatastreamTaskImpl(Arrays.asList(oldDs, newDs));
     sendOneEventThroughTask(task, new Properties(), "someTopicName");
@@ -444,19 +602,23 @@ public class TestEventProducer {
 
   @Test
   public void testSlaGraceDedupedTaskAllStreamsNew() {
-    // All streams on the deduped task are within the grace window → SLA suppressed.
+    // All CDC+BST streams on the deduped task are within the grace window → SLA suppressed.
     long now = System.currentTimeMillis();
 
     Datastream newDsA = DatastreamTestUtils.createDatastreams(DummyConnector.CONNECTOR_TYPE, "ds-newA")[0];
     newDsA.getSource().setConnectionString("mysql:/myhost/testDatabase/myTable");
     newDsA.getMetadata().put(DatastreamMetadataConstants.CREATION_MS, String.valueOf(now));
+    newDsA.getMetadata().put(DatastreamMetadataConstants.CDC_BOOTSTRAP_REQUIRED_KEY, "true");
 
     Datastream newDsB = DatastreamTestUtils.createDatastreams(DummyConnector.CONNECTOR_TYPE, "ds-newB")[0];
     newDsB.getSource().setConnectionString("mysql:/myhost/testDatabase/myTable");
     newDsB.getMetadata().put(DatastreamMetadataConstants.CREATION_MS, String.valueOf(now - 60_000L));
+    newDsB.getMetadata().put(DatastreamMetadataConstants.CDC_BOOTSTRAP_REQUIRED_KEY, "true");
 
+    Properties props = new Properties();
+    props.put("newStreamGracePeriodMs", "7200000"); // explicit 2h grace period
     DatastreamTaskImpl task = new DatastreamTaskImpl(Arrays.asList(newDsA, newDsB));
-    sendOneEventThroughTask(task, new Properties(), "someTopicName");
+    sendOneEventThroughTask(task, props, "someTopicName");
 
     DynamicMetricsManager metrics = DynamicMetricsManager.getInstance();
     Assert.assertNull(metrics.getMetric(SLA_WITHIN_AGG),
@@ -562,6 +724,11 @@ public class TestEventProducer {
   }
 
   private void sendOneEventThroughTask(DatastreamTaskImpl task, Properties props, String topicName) {
+    sendOneEventThroughTask(task, props, topicName, null);
+  }
+
+  private void sendOneEventThroughTask(DatastreamTaskImpl task, Properties props, String topicName,
+      Long commitTimestamp) {
     TransportProvider transport = new NoOpTransportProviderAdminFactory.NoOpTransportProvider() {
       @Override
       public void send(String destination, DatastreamProducerRecord record, SendCallback onComplete) {
@@ -571,11 +738,23 @@ public class TestEventProducer {
       }
     };
     EventProducer eventProducer = new EventProducer(task, transport, new NoOpCheckpointProvider(), props, false);
-    eventProducer.send(createDatastreamProducerRecord(), (m, e) -> { });
+    eventProducer.send(createDatastreamProducerRecord(commitTimestamp), (m, e) -> { });
   }
 
   private DatastreamProducerRecord createDatastreamProducerRecord() {
     return createDatastreamProducerRecord(0, "0", 1);
+  }
+
+  private DatastreamProducerRecord createDatastreamProducerRecord(Long commitTimestamp) {
+    DatastreamProducerRecordBuilder builder = new DatastreamProducerRecordBuilder();
+    builder.setPartition(0);
+    builder.setSourceCheckpoint("0");
+    builder.setEventsSourceTimestamp(System.currentTimeMillis());
+    if (commitTimestamp != null) {
+      builder.setEventsCommitTimestamp(commitTimestamp);
+    }
+    builder.addEvent(new BrooklinEnvelope(new byte[0], new byte[0], null, new HashMap<>()));
+    return builder.build();
   }
 
   private DatastreamProducerRecord createDatastreamProducerRecord(int partition, String checkpoint, int eventCount) {

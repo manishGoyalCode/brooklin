@@ -50,6 +50,7 @@ import com.linkedin.datastream.server.DatastreamServer;
 import com.linkedin.datastream.server.ErrorLogger;
 import com.linkedin.datastream.server.HostTargetAssignment;
 import com.linkedin.datastream.server.api.connector.DatastreamValidationException;
+import com.linkedin.datastream.server.api.lifecycle.DatastreamLifecycleEventType;
 import com.linkedin.datastream.server.api.security.AuthorizationException;
 import com.linkedin.restli.common.HttpStatus;
 import com.linkedin.restli.server.ActionResult;
@@ -240,8 +241,8 @@ public class DatastreamResources extends CollectionResourceTemplate<String, Data
                   + " old: %s new: %s", key, oldDatastream, datastream));
         }
 
-        if (datastream.getMetadata().containsKey(NUM_TASKS) &&
-            !datastream.getMetadata().get(NUM_TASKS).equals(oldDatastream.getMetadata().get(NUM_TASKS))) {
+        if (datastream.getMetadata().containsKey(NUM_TASKS)
+            && !datastream.getMetadata().get(NUM_TASKS).equals(oldDatastream.getMetadata().get(NUM_TASKS))) {
           throw new DatastreamValidationException(String.format("Failed to update %s. Can't update numTasks."
               + " old: %s new: %s", key, oldDatastream, datastream));
         }
@@ -323,6 +324,7 @@ public class DatastreamResources extends CollectionResourceTemplate<String, Data
 
         // invoke post datastream state change action for recently updated datastream
         invokePostDSStateChangeAction(datastreamMap.get(key));
+        notifyDatastreamLifecycle(DatastreamLifecycleEventType.UPDATE, datastreamMap.get(key));
       }
       _coordinator.broadcastDatastreamUpdate();
     } catch (DatastreamException e) {
@@ -381,6 +383,7 @@ public class DatastreamResources extends CollectionResourceTemplate<String, Data
           _store.updateDatastream(d.getName(), d, true);
           // invoke post datastream state change action for recently paused datastream
           invokePostDSStateChangeAction(d);
+          notifyDatastreamLifecycle(DatastreamLifecycleEventType.PAUSE, d);
         } else {
           LOG.warn("Cannot pause datastream {}, as it is not in READY state. State: {}", d, datastream.getStatus());
         }
@@ -536,6 +539,7 @@ public class DatastreamResources extends CollectionResourceTemplate<String, Data
       // set the status as STOPPED as the original status would be READY, PAUSED or STOPPING
       ds.setStatus(DatastreamStatus.STOPPED);
       invokePostDSStateChangeAction(ds);
+      notifyDatastreamLifecycle(DatastreamLifecycleEventType.STOP, ds);
     });
 
     return new ActionResult<>(HttpStatus.S_200_OK);
@@ -560,8 +564,8 @@ public class DatastreamResources extends CollectionResourceTemplate<String, Data
           "Datastream to resume does not exist: " + datastreamName);
     }
 
-    if (!DatastreamStatus.PAUSED.equals(datastream.getStatus()) &&
-        !DatastreamStatus.STOPPED.equals(datastream.getStatus())) {
+    if (!DatastreamStatus.PAUSED.equals(datastream.getStatus())
+        && !DatastreamStatus.STOPPED.equals(datastream.getStatus())) {
       _errorLogger.logAndThrowRestLiServiceException(HttpStatus.S_405_METHOD_NOT_ALLOWED,
           "Datastream is not paused or stopped, cannot resume: " + datastreamName);
     }
@@ -571,12 +575,13 @@ public class DatastreamResources extends CollectionResourceTemplate<String, Data
     LOG.info("Resuming datastreams {}", datastreamsToResume);
     for (Datastream d : datastreamsToResume) {
       try {
-        if (DatastreamStatus.PAUSED.equals(datastream.getStatus()) ||
-            DatastreamStatus.STOPPED.equals(datastream.getStatus())) {
+        if (DatastreamStatus.PAUSED.equals(datastream.getStatus())
+            || DatastreamStatus.STOPPED.equals(datastream.getStatus())) {
           d.setStatus(DatastreamStatus.READY);
           _store.updateDatastream(d.getName(), d, true);
           // invoke post datastream state change action for recently resumed datastream
           invokePostDSStateChangeAction(d);
+          notifyDatastreamLifecycle(DatastreamLifecycleEventType.RESUME, d);
         } else {
           LOG.warn("Will not resume datastream {}, as it is not already in PAUSED/STOPPED state", d);
         }
@@ -780,6 +785,7 @@ public class DatastreamResources extends CollectionResourceTemplate<String, Data
       // original Datastream instance then invoke post datastream state change action for recently deleted datastream
       datastream.setStatus(DatastreamStatus.DELETING);
       invokePostDSStateChangeAction(datastream);
+      notifyDatastreamLifecycle(DatastreamLifecycleEventType.DELETE, datastream);
 
       return new UpdateResponse(HttpStatus.S_200_OK);
     } catch (Exception e) {
@@ -962,6 +968,7 @@ public class DatastreamResources extends CollectionResourceTemplate<String, Data
 
       // invoke post datastream state change action for recently created datastream
       invokePostDSStateChangeAction(datastream);
+      notifyDatastreamLifecycle(DatastreamLifecycleEventType.CREATE, datastream);
 
       return new CreateResponse(datastream.getName(), HttpStatus.S_201_CREATED);
     } catch (IllegalArgumentException e) {
@@ -998,6 +1005,20 @@ public class DatastreamResources extends CollectionResourceTemplate<String, Data
     } catch (DatastreamException e) {
       _errorLogger.logAndThrowRestLiServiceException(HttpStatus.S_500_INTERNAL_SERVER_ERROR,
           "Failed to perform post datastream state change action datastream=" + datastream, e);
+    }
+  }
+
+  /**
+   * Best-effort notification of the configured {@link com.linkedin.datastream.server.api.lifecycle.DatastreamLifecycleListener}
+   * after a datastream lifecycle transition has been persisted. Listener failures are swallowed and never
+   * affect the outcome of the REST request.
+   */
+  private void notifyDatastreamLifecycle(DatastreamLifecycleEventType eventType, Datastream datastream) {
+    try {
+      _coordinator.getDatastreamLifecycleListener().onDatastreamLifecycleEvent(eventType, datastream);
+    } catch (Exception e) {
+      LOG.warn("Datastream lifecycle listener failed for eventType={} datastream={}", eventType,
+          datastream == null ? null : datastream.getName(), e);
     }
   }
 

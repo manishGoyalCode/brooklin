@@ -52,7 +52,9 @@ import org.testng.annotations.AfterMethod;
 import org.testng.annotations.BeforeMethod;
 import org.testng.annotations.Test;
 
+import com.codahale.metrics.Counter;
 import com.codahale.metrics.Gauge;
+import com.codahale.metrics.Histogram;
 import com.codahale.metrics.Meter;
 import com.codahale.metrics.MetricRegistry;
 import com.google.common.collect.ImmutableList;
@@ -103,11 +105,10 @@ import static com.linkedin.datastream.common.DatastreamMetadataConstants.CREATIO
 import static com.linkedin.datastream.common.DatastreamMetadataConstants.SYSTEM_DESTINATION_PREFIX;
 import static com.linkedin.datastream.common.DatastreamMetadataConstants.TTL_MS;
 import static com.linkedin.datastream.server.assignment.StickyMulticastStrategyFactory.DEFAULT_IMBALANCE_THRESHOLD;
-import static org.mockito.Matchers.argThat;
+import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.Mockito.any;
 import static org.mockito.Mockito.anyBoolean;
 import static org.mockito.Mockito.anyLong;
-import static org.mockito.Mockito.anyObject;
 import static org.mockito.Mockito.anyString;
 import static org.mockito.Mockito.atLeast;
 import static org.mockito.Mockito.doAnswer;
@@ -2491,6 +2492,246 @@ public class TestCoordinator {
   }
 
   @Test
+  public void testStreamProvisioningTimeMetricsOnCreate() throws Exception {
+    String testCluster = "testStreamProvisioningTimeMetricsOnCreate";
+    String connectorType = "testConnectorType";
+    String datastreamName = "TestStreamProvisioningStream";
+
+    Properties override = new Properties();
+    override.put(CoordinatorConfig.CONFIG_PROVISIONING_SLA_THRESHOLD_MS, "0");
+
+    Coordinator coordinator = createCoordinator(_zkConnectionString, testCluster, override);
+    TestHookConnector connector = new TestHookConnector("connector1", connectorType);
+    coordinator.addConnector(connectorType, connector, new BroadcastStrategy(Optional.empty()), false,
+        new SourceBasedDeduper(), null);
+    coordinator.start();
+
+    Histogram histogramBefore =
+        DynamicMetricsManager.getInstance().getMetric("Coordinator.streamProvisioningTimeMs");
+    long histogramCountBefore = histogramBefore == null ? 0L : histogramBefore.getCount();
+
+    Counter totalBefore =
+        DynamicMetricsManager.getInstance().getMetric("Coordinator.numStreamsProvisioned");
+    long totalCountBefore = totalBefore == null ? 0L : totalBefore.getCount();
+
+    Counter outsideSlaBefore =
+        DynamicMetricsManager.getInstance().getMetric("Coordinator.numStreamsProvisionedOutsideSla");
+    long outsideSlaCountBefore = outsideSlaBefore == null ? 0L : outsideSlaBefore.getCount();
+
+    ZkClient zkClient = new ZkClient(_zkConnectionString);
+    DatastreamTestUtils.createAndStoreDatastreams(zkClient, testCluster, connectorType, datastreamName);
+    Assert.assertTrue(PollUtils.poll(() -> DatastreamStatus.READY.equals(
+        DatastreamTestUtils.getDatastream(zkClient, testCluster, datastreamName).getStatus()), 200, 30000));
+
+    Histogram histogram =
+        DynamicMetricsManager.getInstance().getMetric("Coordinator.streamProvisioningTimeMs");
+    Assert.assertNotNull(histogram,
+        "Coordinator.streamProvisioningTimeMs histogram should be registered after a stream goes READY");
+    Assert.assertTrue(PollUtils.poll(() -> histogram.getCount() > histogramCountBefore, 100, 30000),
+        "streamProvisioningTimeMs histogram count did not increase after stream transitioned to READY");
+    long maxValue = histogram.getSnapshot().getMax();
+    Assert.assertTrue(maxValue >= 0, "streamProvisioningTimeMs sample should be non-negative, got: " + maxValue);
+
+    // The total provisioned counter must increment for every stream that reaches READY.
+    Counter total =
+        DynamicMetricsManager.getInstance().getMetric("Coordinator.numStreamsProvisioned");
+    Assert.assertNotNull(total,
+        "Coordinator.numStreamsProvisioned counter should be registered after a stream goes READY");
+    Assert.assertTrue(PollUtils.poll(() -> total.getCount() > totalCountBefore, 100, 30000),
+        "numStreamsProvisioned should increment when a stream goes READY");
+
+    // With a threshold of 0, any positive provisioning duration is classified as outside SLA.
+    Counter outsideSla =
+        DynamicMetricsManager.getInstance().getMetric("Coordinator.numStreamsProvisionedOutsideSla");
+    Assert.assertNotNull(outsideSla,
+        "Coordinator.numStreamsProvisionedOutsideSla counter should be registered after a stream goes READY");
+    Assert.assertTrue(PollUtils.poll(() -> outsideSla.getCount() > outsideSlaCountBefore, 100, 30000),
+        "numStreamsProvisionedOutsideSla should increment when duration exceeds threshold");
+
+    coordinator.stop();
+    coordinator.getDatastreamCache().getZkclient().close();
+    zkClient.close();
+  }
+
+
+  @Test
+  public void testProvisioningSloCountsWithinSlaWhenBelowThreshold() throws Exception {
+    String testCluster = "testProvisioningSloWithinSla";
+    String connectorType = "testConnectorType";
+    String datastreamName = "TestFastStream";
+
+    Properties override = new Properties();
+    override.put(CoordinatorConfig.CONFIG_PROVISIONING_SLA_THRESHOLD_MS,
+        String.valueOf(Duration.ofHours(1).toMillis()));
+
+    Coordinator coordinator = createCoordinator(_zkConnectionString, testCluster, override);
+    TestHookConnector connector = new TestHookConnector("connector1", connectorType);
+    coordinator.addConnector(connectorType, connector, new BroadcastStrategy(Optional.empty()), false,
+        new SourceBasedDeduper(), null);
+    coordinator.start();
+
+    Counter withinSlaBefore =
+        DynamicMetricsManager.getInstance().getMetric("Coordinator.numStreamsProvisionedWithinSla");
+    long withinSlaCountBefore = withinSlaBefore == null ? 0L : withinSlaBefore.getCount();
+
+    Counter outsideSlaBefore =
+        DynamicMetricsManager.getInstance().getMetric("Coordinator.numStreamsProvisionedOutsideSla");
+    long outsideSlaCountBefore = outsideSlaBefore == null ? 0L : outsideSlaBefore.getCount();
+
+    Histogram histogramBefore =
+        DynamicMetricsManager.getInstance().getMetric("Coordinator.streamProvisioningTimeMs");
+    long histogramCountBefore = histogramBefore == null ? 0L : histogramBefore.getCount();
+
+    ZkClient zkClient = new ZkClient(_zkConnectionString);
+    DatastreamTestUtils.createAndStoreDatastreams(zkClient, testCluster, connectorType, datastreamName);
+    Assert.assertTrue(PollUtils.poll(() -> DatastreamStatus.READY.equals(
+        DatastreamTestUtils.getDatastream(zkClient, testCluster, datastreamName).getStatus()), 200, 30000));
+
+    // Wait for the histogram to increment - this proves recordStreamProvisioningTime has finished
+    // running, which means the within/outside SLA classification has been made.
+    Histogram histogram =
+        DynamicMetricsManager.getInstance().getMetric("Coordinator.streamProvisioningTimeMs");
+    Assert.assertNotNull(histogram, "Histogram should exist after stream goes READY");
+    Assert.assertTrue(PollUtils.poll(() -> histogram.getCount() > histogramCountBefore, 100, 30000),
+        "Histogram count did not increment - recordStreamProvisioningTime may not have run yet");
+
+    // With a 1-hour threshold the provisioning duration is below SLA, so the within-SLA counter
+    // increments and the outside-SLA counter must not.
+    Counter withinSla =
+        DynamicMetricsManager.getInstance().getMetric("Coordinator.numStreamsProvisionedWithinSla");
+    Assert.assertNotNull(withinSla, "numStreamsProvisionedWithinSla counter should exist after stream goes READY");
+    Assert.assertTrue(PollUtils.poll(() -> withinSla.getCount() > withinSlaCountBefore, 100, 30000),
+        "numStreamsProvisionedWithinSla should increment when duration is below threshold");
+
+    Counter outsideSla =
+        DynamicMetricsManager.getInstance().getMetric("Coordinator.numStreamsProvisionedOutsideSla");
+    if (outsideSla != null) {
+      Assert.assertEquals(outsideSla.getCount(), outsideSlaCountBefore,
+          "numStreamsProvisionedOutsideSla must not increment when duration is below threshold");
+    }
+
+    coordinator.stop();
+    coordinator.getDatastreamCache().getZkclient().close();
+    zkClient.close();
+  }
+
+  /**
+   * Resuming a datastream STOPPED -> READY must NOT update the streamProvisioningTimeMs histogram or any of the
+   * provisioning SLO counters. These metrics are intended to capture only the initial creation
+   * flow's INITIALIZING -> READY transition.
+   */
+  @Test
+  public void testStreamProvisioningTimeMetricsNotEmittedOnResume() throws Exception {
+    String testCluster = "testStreamProvisioningTimeMetricsNotEmittedOnResume";
+    String connectorType = "testConnectorType";
+    String datastreamName = "TestResumeStream";
+
+    // Threshold of 0 ensures any positive duration would be classified as outside SLA — so the
+    // assertion that the counters do NOT increase on resume is meaningful (it's not just below-threshold).
+    Properties override = new Properties();
+    override.put(CoordinatorConfig.CONFIG_PROVISIONING_SLA_THRESHOLD_MS, "0");
+
+    Coordinator coordinator = createCoordinator(_zkConnectionString, testCluster, override);
+    TestHookConnector connector = new TestHookConnector("connector1", connectorType);
+    coordinator.addConnector(connectorType, connector, new BroadcastStrategy(Optional.empty()), false,
+        new SourceBasedDeduper(), null);
+    coordinator.start();
+
+    ZkClient zkClient = new ZkClient(_zkConnectionString);
+    DatastreamTestUtils.createAndStoreDatastreams(zkClient, testCluster, connectorType, datastreamName);
+    Assert.assertTrue(PollUtils.poll(() -> DatastreamStatus.READY.equals(
+        DatastreamTestUtils.getDatastream(zkClient, testCluster, datastreamName).getStatus()), 200, 30000));
+
+    // Capture counts after the initial creation has settled.
+    Histogram histogram =
+        DynamicMetricsManager.getInstance().getMetric("Coordinator.streamProvisioningTimeMs");
+    Assert.assertNotNull(histogram, "Histogram should exist after the initial create");
+    Counter total =
+        DynamicMetricsManager.getInstance().getMetric("Coordinator.numStreamsProvisioned");
+    Assert.assertNotNull(total, "numStreamsProvisioned counter should exist after the initial create");
+    Counter outsideSla =
+        DynamicMetricsManager.getInstance().getMetric("Coordinator.numStreamsProvisionedOutsideSla");
+    Assert.assertNotNull(outsideSla, "numStreamsProvisionedOutsideSla counter should exist after the initial create");
+    long histogramCountAfterCreate = histogram.getCount();
+    long totalCountAfterCreate = total.getCount();
+    long outsideSlaCountAfterCreate = outsideSla.getCount();
+
+    // Stop and then resume the datastream. The resume path bypasses the INITIALIZING -> READY
+    // transition in handleDatastreamAddOrDelete, so neither metric should change.
+    Datastream ds = DatastreamTestUtils.getDatastream(zkClient, testCluster, datastreamName);
+    ds.setStatus(DatastreamStatus.STOPPED);
+    DatastreamTestUtils.updateDatastreams(zkClient, testCluster, ds);
+    Assert.assertTrue(PollUtils.poll(() -> DatastreamStatus.STOPPED.equals(
+        DatastreamTestUtils.getDatastream(zkClient, testCluster, datastreamName).getStatus()), 200, 30000));
+
+    ds.setStatus(DatastreamStatus.READY);
+    DatastreamTestUtils.updateDatastreams(zkClient, testCluster, ds);
+    Assert.assertTrue(PollUtils.poll(() -> DatastreamStatus.READY.equals(
+        DatastreamTestUtils.getDatastream(zkClient, testCluster, datastreamName).getStatus()), 200, 30000));
+
+    // Give the coordinator event loop time to process anything it might (incorrectly) do.
+    Thread.sleep(500);
+    Assert.assertEquals(histogram.getCount(), histogramCountAfterCreate,
+        "streamProvisioningTimeMs histogram count must not increase on resume from STOPPED");
+    Assert.assertEquals(total.getCount(), totalCountAfterCreate,
+        "numStreamsProvisioned counter must not increase on resume from STOPPED");
+    Assert.assertEquals(outsideSla.getCount(), outsideSlaCountAfterCreate,
+        "numStreamsProvisionedOutsideSla counter must not increase on resume from STOPPED");
+
+    coordinator.stop();
+    coordinator.getDatastreamCache().getZkclient().close();
+    zkClient.close();
+  }
+
+  /**
+   * The provisioning SLO counters are emitted both as an aggregate and keyed by connector name, so the
+   * SLO and its misses can be broken down per connector type. This asserts the per-connector keyed series
+   * (Coordinator.&lt;connectorName&gt;.numStreams...) increments alongside the aggregate.
+   */
+  @Test
+  public void testProvisioningSloCountersAreKeyedByConnector() throws Exception {
+    String testCluster = "testProvisioningSloKeyedByConnector";
+    String connectorType = "testConnectorType";
+    String datastreamName = "TestKeyedStream";
+
+    // Threshold of 0 classifies any positive duration as outside SLA.
+    Properties override = new Properties();
+    override.put(CoordinatorConfig.CONFIG_PROVISIONING_SLA_THRESHOLD_MS, "0");
+
+    Coordinator coordinator = createCoordinator(_zkConnectionString, testCluster, override);
+    TestHookConnector connector = new TestHookConnector("connector1", connectorType);
+    coordinator.addConnector(connectorType, connector, new BroadcastStrategy(Optional.empty()), false,
+        new SourceBasedDeduper(), null);
+    coordinator.start();
+
+    String keyedTotalName = "Coordinator." + connectorType + ".numStreamsProvisioned";
+    String keyedOutsideSlaName = "Coordinator." + connectorType + ".numStreamsProvisionedOutsideSla";
+    Counter keyedTotalBefore = DynamicMetricsManager.getInstance().getMetric(keyedTotalName);
+    long keyedTotalCountBefore = keyedTotalBefore == null ? 0L : keyedTotalBefore.getCount();
+
+    ZkClient zkClient = new ZkClient(_zkConnectionString);
+    DatastreamTestUtils.createAndStoreDatastreams(zkClient, testCluster, connectorType, datastreamName);
+    Assert.assertTrue(PollUtils.poll(() -> DatastreamStatus.READY.equals(
+        DatastreamTestUtils.getDatastream(zkClient, testCluster, datastreamName).getStatus()), 200, 30000));
+
+    // The per-connector total must increment for the stream that reached READY.
+    Assert.assertTrue(PollUtils.poll(() -> {
+      Counter c = DynamicMetricsManager.getInstance().getMetric(keyedTotalName);
+      return c != null && c.getCount() > keyedTotalCountBefore;
+    }, 100, 30000), keyedTotalName + " should increment when a stream from this connector goes READY");
+
+    // With threshold 0 the per-connector outside-SLA series must also be present and incremented.
+    Counter keyedOutsideSla = DynamicMetricsManager.getInstance().getMetric(keyedOutsideSlaName);
+    Assert.assertNotNull(keyedOutsideSla, keyedOutsideSlaName + " should be registered after the stream goes READY");
+    Assert.assertTrue(keyedOutsideSla.getCount() > 0,
+        keyedOutsideSlaName + " should increment when duration exceeds threshold");
+
+    coordinator.stop();
+    coordinator.getDatastreamCache().getZkclient().close();
+    zkClient.close();
+  }
+
+  @Test
   public void testHeartbeat() throws Exception {
     // Use 1s heartbeat period for quicker execution
     Properties override = new Properties();
@@ -2508,7 +2749,7 @@ public class TestCoordinator {
         counter.incrementAndGet();
       }
       return null;
-    }).when(dynMM).createOrUpdateCounter(anyString(), anyObject(), anyLong());
+    }).when(dynMM).createOrUpdateCounter(anyString(), any(), anyLong());
 
     Object metrics = ReflectionUtils.getField(coordinator, "_metrics");
     ReflectionUtils.setField(metrics, "_dynamicMetricsManager", dynMM);
@@ -2549,7 +2790,7 @@ public class TestCoordinator {
   public void testDatastreamAuthorizationHappyPath() throws Exception {
     createTestCoordinator();
     Authorizer authz = mock(Authorizer.class);
-    when(authz.authorize(anyObject(), anyObject(), anyObject())).thenReturn(true);
+    when(authz.authorize(any(), any(), any())).thenReturn(true);
 
     // Check default retention when no topicConfig is specified
     String datastreamName = "testDatastreamAuthorization";
@@ -3801,6 +4042,90 @@ public class TestCoordinator {
   }
 
   @Test
+  public void testThroughputViolatingTopicsPeriodicRefreshRebuildsStaleMap() throws Exception {
+    String testCluster = "testThroughputViolatingTopicsPeriodicRefreshRebuildsStaleMap";
+    String connectorType = "connectorType";
+    String streamName = "testThroughputViolatingTopicsPeriodicRefreshRebuildsStaleMap";
+
+    Properties properties = new Properties();
+    properties.put(CoordinatorConfig.CONFIG_ENABLE_THROUGHPUT_VIOLATING_TOPICS_HANDLING, Boolean.TRUE.toString());
+    // Short refresh period so the scheduled rebuild fires within the test window.
+    properties.put(CoordinatorConfig.CONFIG_THROUGHPUT_VIOLATING_TOPICS_REFRESH_PERIOD_MS,
+        String.valueOf(Duration.ofMillis(500).toMillis()));
+    Coordinator coordinator = createCoordinator(_zkConnectionString, testCluster, properties);
+    TestHookConnector connector1 = new TestHookConnector("connector1", connectorType);
+    coordinator.addConnector(connectorType, connector1, new BroadcastStrategy(Optional.empty()), false,
+        new SourceBasedDeduper(), null);
+    coordinator.start();
+
+    ZkClient zkClient = new ZkClient(_zkConnectionString);
+    DatastreamStore store = new ZookeeperBackedDatastreamStore(_cachedDatastreamReader, zkClient, testCluster);
+    DatastreamResources resource = new DatastreamResources(store, coordinator);
+
+    Set<String> requestedThroughputViolatingTopics = new HashSet<>(Arrays.asList("OneTopic", "TwoTopic", "ThreeTopic"));
+    Datastream testStream = DatastreamTestUtils.createDatastreams(connectorType, streamName)[0];
+    Objects.requireNonNull(testStream.getMetadata())
+        .put(DatastreamMetadataConstants.THROUGHPUT_VIOLATING_TOPICS,
+            String.join(",", requestedThroughputViolatingTopics));
+    resource.create(testStream);
+
+    // Re-fetches the cache on every poll iteration (unlike validateIfViolatingTopicsAreReflectedInServer,
+    // which snapshots once) so it can observe the async rebuild after the cache is cleared.
+    BooleanSupplier cacheMatchesRequested = () -> {
+      Set<String> fetched = coordinator.getThroughputViolatingTopics(Collections.singletonList(testStream));
+      return fetched.size() == requestedThroughputViolatingTopics.size()
+          && fetched.containsAll(requestedThroughputViolatingTopics);
+    };
+
+    // Cache is populated on the create trigger.
+    Assert.assertTrue(PollUtils.poll(cacheMatchesRequested, Duration.ofMillis(200).toMillis(),
+        Duration.ofSeconds(5).toMillis()));
+
+    // Simulate a stale/emptied cache left behind by a missed or failed rebuild. No further assignment or
+    // datastream-update event occurs, so only the periodic refresh can repopulate it.
+    coordinator.clearThroughputViolatingTopicsMapForTesting();
+
+    // The periodic refresh must rebuild the cache from the current assignment.
+    Assert.assertTrue(PollUtils.poll(cacheMatchesRequested, Duration.ofMillis(200).toMillis(),
+        Duration.ofSeconds(10).toMillis()));
+
+    coordinator.stop();
+    zkClient.close();
+    coordinator.getDatastreamCache().getZkclient().close();
+  }
+
+  @Test
+  public void testThroughputViolatingTopicsPeriodicRefreshEnablementGating() throws Exception {
+    // Handling on, periodic refresh defaults to on.
+    Properties refreshDefault = new Properties();
+    refreshDefault.put(CoordinatorConfig.CONFIG_ENABLE_THROUGHPUT_VIOLATING_TOPICS_HANDLING, Boolean.TRUE.toString());
+    Coordinator refreshOnByDefault = createCoordinator(_zkConnectionString,
+        "testThroughputViolatingTopicsPeriodicRefreshEnablementGatingDefault", refreshDefault);
+    Assert.assertTrue(refreshOnByDefault.isThroughputViolatingTopicsPeriodicRefreshEnabled());
+    refreshOnByDefault.getDatastreamCache().getZkclient().close();
+
+    // Handling on, periodic refresh explicitly off -> disabled.
+    Properties refreshOff = new Properties();
+    refreshOff.put(CoordinatorConfig.CONFIG_ENABLE_THROUGHPUT_VIOLATING_TOPICS_HANDLING, Boolean.TRUE.toString());
+    refreshOff.put(CoordinatorConfig.CONFIG_ENABLE_THROUGHPUT_VIOLATING_TOPICS_PERIODIC_REFRESH,
+        Boolean.FALSE.toString());
+    Coordinator refreshDisabled = createCoordinator(_zkConnectionString,
+        "testThroughputViolatingTopicsPeriodicRefreshEnablementGatingOff", refreshOff);
+    Assert.assertFalse(refreshDisabled.isThroughputViolatingTopicsPeriodicRefreshEnabled());
+    refreshDisabled.getDatastreamCache().getZkclient().close();
+
+    // Handling off -> periodic refresh is off regardless of the toggle.
+    Properties handlingOff = new Properties();
+    handlingOff.put(CoordinatorConfig.CONFIG_ENABLE_THROUGHPUT_VIOLATING_TOPICS_HANDLING, Boolean.FALSE.toString());
+    handlingOff.put(CoordinatorConfig.CONFIG_ENABLE_THROUGHPUT_VIOLATING_TOPICS_PERIODIC_REFRESH,
+        Boolean.TRUE.toString());
+    Coordinator handlingDisabled = createCoordinator(_zkConnectionString,
+        "testThroughputViolatingTopicsPeriodicRefreshEnablementGatingHandlingOff", handlingOff);
+    Assert.assertFalse(handlingDisabled.isThroughputViolatingTopicsPeriodicRefreshEnabled());
+    handlingDisabled.getDatastreamCache().getZkclient().close();
+  }
+
+  @Test
   public void testThroughputViolatingTopicsHandlingForMultipleDatastreams() throws Exception {
     String testCluster = "testThroughputViolatingTopicsHandlingForMultipleDatastreams";
     String connectorType = "connectorType";
@@ -4058,7 +4383,15 @@ public class TestCoordinator {
               protected synchronized void handleEvent(CoordinatorEvent event) {
                 CoordinatorEvent previousHead = peekCoordinatorEventBlockingQueue();
                 super.handleEvent(event);
-                PollUtils.poll(() -> peekCoordinatorEventBlockingQueue() != null, 50, 1000);
+                // On failure the LEADER_DO_ASSIGNMENT retry is re-queued asynchronously by
+                // scheduleLeaderDoAssignmentRetry() on a separate executor thread, so it may not be
+                // at the front of the queue the instant handleEvent() returns. Wait for the retry
+                // event to actually reach the front rather than merely waiting for the queue to be
+                // non-empty -- otherwise nextHead races with the async putFirst() and can observe an
+                // unrelated event (e.g. HANDLE_ASSIGNMENT_CHANGE), making this test flaky.
+                PollUtils.poll(
+                    () -> leaderDoAssignmentForNewlyElectedLeader.equals(peekCoordinatorEventBlockingQueue()),
+                    50, 1000);
                 CoordinatorEvent nextHead = peekCoordinatorEventBlockingQueue();
 
                 // recording previous and new heads of the CoordinatorEventBlockingQueue
@@ -4300,7 +4633,7 @@ public class TestCoordinator {
     zkClient.deleteRecursive(path);
   }
 
-  static class CollectionContainsMatcher<T> extends ArgumentMatcher<List<T>> {
+  static class CollectionContainsMatcher<T> implements ArgumentMatcher<List<T>> {
     private final T _element;
 
     public CollectionContainsMatcher(T element) {
@@ -4308,14 +4641,12 @@ public class TestCoordinator {
     }
 
     @Override
-    @SuppressWarnings("unchecked")
-    public boolean matches(Object argument) {
-      if (!(argument instanceof List)) {
+    public boolean matches(List<T> argument) {
+      if (argument == null) {
         return false;
       }
 
-      List<T> argumentAsList = (List<T>) argument;
-      return argumentAsList.contains(_element);
+      return argument.contains(_element);
     }
   }
 
@@ -4514,14 +4845,16 @@ public class TestCoordinator {
   private Duration setAssignmentTimeout(Duration newTimeout) throws Exception {
     Field field = Coordinator.class.getDeclaredField("ASSIGNMENT_TIMEOUT");
     field.setAccessible(true);
-
-    // Remove the 'final' modifier so we can write to the field
-    Field modifiersField = Field.class.getDeclaredField("modifiers");
-    modifiersField.setAccessible(true);
-    modifiersField.setInt(field, field.getModifiers() & ~java.lang.reflect.Modifier.FINAL);
-
     Duration original = (Duration) field.get(null);
-    field.set(null, newTimeout);
+
+    // JDK 12+ blocks the legacy "strip the final modifier via Field.modifiers" reflection hack (the
+    // modifiers field is hidden by the core reflection filter), so write the static final field
+    // through sun.misc.Unsafe instead. Fully qualified to avoid the checkstyle sun.* import ban.
+    Field theUnsafeField = sun.misc.Unsafe.class.getDeclaredField("theUnsafe");
+    theUnsafeField.setAccessible(true);
+    sun.misc.Unsafe unsafe = (sun.misc.Unsafe) theUnsafeField.get(null);
+    unsafe.putObject(unsafe.staticFieldBase(field), unsafe.staticFieldOffset(field), newTimeout);
+
     return original;
   }
 

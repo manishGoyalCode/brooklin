@@ -8,7 +8,10 @@ package com.linkedin.datastream.kafka;
 /**
  * Metadata constants that are specific to Kafka (or Kafka MirrorMaker) datastreams.
  */
-public class KafkaDatastreamMetadataConstants {
+public final class KafkaDatastreamMetadataConstants {
+
+  private KafkaDatastreamMetadataConstants() {
+  }
 
   // Can be used by the transport provider to send to a particular Kafka cluster
   public static final String DESTINATION_KAFKA_BROKERS = "system.destination.KafkaBrokers";
@@ -22,4 +25,8 @@ public class KafkaDatastreamMetadataConstants {
 
   // Enable topic auto creation for this Kafka data stream
   public static final String ENABLE_TOPIC_AUTO_CREATION = "system.enableTopicAutoCreation";
+
+  // Kafka consumer start position values used when no checkpoint exists for a CDC datastream
+  public static final String CDC_START_POSITION_EARLIEST = "earliest";
+  public static final String CDC_START_POSITION_LATEST = "latest";
 }

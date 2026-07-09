@@ -35,7 +35,7 @@ import com.linkedin.datastream.common.JsonUtils;
 /**
  * The main class containing the entry point of the Datastream REST client command line utility
  */
-public class DatastreamRestClientCli {
+public final class DatastreamRestClientCli {
 
   private DatastreamRestClientCli() {
   }
@@ -57,7 +57,7 @@ public class DatastreamRestClientCli {
   }
 
   private static void printDatastreams(boolean noformat, List<Datastream> streams) {
-    ObjectMapper mapper = new ObjectMapper();
+    ObjectMapper mapper = JsonUtils.newObjectMapper();
 
     streams.forEach(s -> {
       try {

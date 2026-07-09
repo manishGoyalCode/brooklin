@@ -8,7 +8,10 @@ package com.linkedin.datastream.common;
 /**
  * Various well known config keys used in datastream metadata.
  */
-public class DatastreamMetadataConstants {
+public final class DatastreamMetadataConstants {
+
+  private DatastreamMetadataConstants() {
+  }
 
   /**
    * Represents whether the datastream has an User managed destination (a.k.a BYOT - Bring your own topic)
@@ -90,6 +93,11 @@ public class DatastreamMetadataConstants {
   public static final String CREATION_MS = "system.creation.ms";
 
   /**
+   * Time spent running create validation in milliseconds.
+   */
+  public static final String CREATE_VALIDATION_TIME_MS = "system.createValidationTime.ms";
+
+  /**
    * Position at which the ingestion should start for the datastream.
    */
   public static final String START_POSITION = "system.start.position";
@@ -136,4 +144,16 @@ public class DatastreamMetadataConstants {
    * which at least one partition violates the brooklin's permissible throughput bounds.
    */
   public static final String THROUGHPUT_VIOLATING_TOPICS = "throughputViolatingTopics";
+
+  /**
+   * Indicates whether the datastream requires CDC bootstrap, i.e. the consumer offset is
+   * initialized to an earlier position to replay historical data before catching up to the live tail.
+   */
+  public static final String CDC_BOOTSTRAP_REQUIRED_KEY = "system.cdcBootstrapRequired";
+
+  /**
+   * Datastream metadata key set to {@code "true"} when all bootstrap tasks for a datastream group
+   * have completed sending their End-of-Bootstrap (EOB) events.
+   */
+  public static final String IS_BOOTSTRAP_COMPLETE = "system.isBootstrapComplete";
 }

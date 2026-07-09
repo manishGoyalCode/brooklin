@@ -65,6 +65,7 @@ import com.linkedin.datastream.common.PollUtils;
 import com.linkedin.datastream.common.VerifiableProperties;
 import com.linkedin.datastream.metrics.BrooklinCounterInfo;
 import com.linkedin.datastream.metrics.BrooklinGaugeInfo;
+import com.linkedin.datastream.metrics.BrooklinHistogramInfo;
 import com.linkedin.datastream.metrics.BrooklinMeterInfo;
 import com.linkedin.datastream.metrics.BrooklinMetricInfo;
 import com.linkedin.datastream.metrics.DynamicMetricsManager;
@@ -74,6 +75,7 @@ import com.linkedin.datastream.serde.SerDeSet;
 import com.linkedin.datastream.server.api.connector.Connector;
 import com.linkedin.datastream.server.api.connector.DatastreamDeduper;
 import com.linkedin.datastream.server.api.connector.DatastreamValidationException;
+import com.linkedin.datastream.server.api.lifecycle.DatastreamLifecycleListener;
 import com.linkedin.datastream.server.api.security.AuthorizationException;
 import com.linkedin.datastream.server.api.security.Authorizer;
 import com.linkedin.datastream.server.api.serde.SerdeAdmin;
@@ -84,6 +86,7 @@ import com.linkedin.datastream.server.providers.CheckpointProvider;
 import com.linkedin.datastream.server.providers.ZookeeperCheckpointProvider;
 import com.linkedin.datastream.server.zk.ZkAdapter;
 
+import static com.linkedin.datastream.common.DatastreamMetadataConstants.CREATE_VALIDATION_TIME_MS;
 import static com.linkedin.datastream.common.DatastreamMetadataConstants.CREATION_MS;
 import static com.linkedin.datastream.common.DatastreamMetadataConstants.SYSTEM_DESTINATION_PREFIX;
 import static com.linkedin.datastream.common.DatastreamMetadataConstants.THROUGHPUT_VIOLATING_TOPICS;
@@ -178,9 +181,37 @@ public class Coordinator implements ZkAdapter.ZkAdapterListener, MetricsAware {
 
   private static final Duration ASSIGNMENT_TIMEOUT = Duration.ofSeconds(90);
 
+  // Histogram capturing the duration between datastream creation and the INITIALIZING -> READY transition.
+  // With a 5-min sliding window and sparse provisioning events (typically minutes-to-hours apart),
+  // each event lands as an isolated ~5-min plateau in the exported .99thPercentile time series —
+  // effectively a per-event scatter view.
+  private static final String STREAM_PROVISIONING_TIME_MS = "streamProvisioningTimeMs";
+  private static final long STREAM_PROVISIONING_TIME_HISTOGRAM_WINDOW_MS = Duration.ofMinutes(5).toMillis();
+
   private static final AtomicLong PAUSED_DATASTREAMS_GROUPS = new AtomicLong(0L);
 
   private static final AtomicLong MAX_PARTITION_COUNT = new AtomicLong(0L);
+
+  // Trigger identifiers and log messages for (re)building the host-level throughput-violating topics cache.
+  private static final String TRIGGER_CREATE = "create";
+  private static final String TRIGGER_UPDATE = "update";
+  private static final String TRIGGER_PERIODIC_REFRESH = "periodic refresh";
+  private static final String POPULATE_VIOLATING_TOPICS_MSG =
+      "Populating the datastream violating topics to host level cache from the datastream objects on the {} trigger";
+  private static final String POPULATE_VIOLATING_TOPICS_EXCEPTION_MSG =
+      "Received an exception while populating the datastream violating topics to host level cache from the datastream "
+          + "objects on the {} trigger";
+  private static final String DROP_UNRESOLVED_TASK_MSG =
+      "Dropping task {} while rebuilding throughput-violating topics map on the {} trigger; its datastream task could "
+          + "not be resolved and will be omitted from this rebuild";
+  private static final String EMPTY_REBUILD_MSG =
+      "Throughput-violating topics map rebuild on the {} trigger produced an EMPTY result from a non-empty assignment "
+          + "of {} task(s); the host-level cache will be cleared. Possible partial assignment during rebalance.";
+  private static final String PARTIAL_REBUILD_MSG =
+      "Throughput-violating topics map rebuild on the {} trigger dropped {} of {} assigned task(s); the rebuild may "
+          + "be partial.";
+  private static final String SCHEDULED_PERIODIC_REFRESH_MSG =
+      "Scheduled periodic throughput-violating topics map refresh every {} ms";
 
   private final CachedDatastreamReader _datastreamCache;
   private final Properties _eventProducerConfig;
@@ -218,6 +249,11 @@ public class Coordinator implements ZkAdapter.ZkAdapterListener, MetricsAware {
 
   private final Map<String, SerdeAdmin> _serdeAdmins = new HashMap<>();
   private final Map<String, Authorizer> _authorizers = new HashMap<>();
+
+  // Optional observability listener notified of datastream lifecycle transitions (create/update/delete/
+  // pause/resume/stop). Defaults to a no-op; typically set once during server bootstrap.
+  private volatile DatastreamLifecycleListener _datastreamLifecycleListener = (eventType, datastream) -> { };
+
   private volatile boolean _shutdown = false;
   // TODO we have _shutdown, eventThread and now _coordinatorEventThreadExiting, for some distinct usage,
   //  we should revisit and refactor to have less variation
@@ -324,6 +360,18 @@ public class Coordinator implements ZkAdapter.ZkAdapterListener, MetricsAware {
     // Queue up one heartbeat per period with a initial delay of 3 periods
     _scheduledExecutor.scheduleAtFixedRate(() -> _eventQueue.put(CoordinatorEvent.HEARTBEAT_EVENT),
         _heartbeatPeriod.toMillis() * 3, _heartbeatPeriod.toMillis(), TimeUnit.MILLISECONDS);
+
+    // Periodically rebuild the throughput-violating topics host-level cache so its freshness is bounded by
+    // the refresh period rather than by rebalance timing. Gated by both the feature flag and the
+    // dedicated periodic-refresh toggle (enableThroughputViolatingTopicsPeriodicRefresh). The scheduled
+    // executor lives for the coordinator's lifetime (created here, shut down in stop()), so this is scheduled
+    // once and is not re-registered in onNewSession().
+    if (isThroughputViolatingTopicsPeriodicRefreshEnabled()) {
+      long refreshPeriodMs = _config.getThroughputViolatingTopicsRefreshPeriodMs();
+      _scheduledExecutor.scheduleAtFixedRate(this::runScheduledThroughputViolatingTopicsRefresh,
+          refreshPeriodMs, refreshPeriodMs, TimeUnit.MILLISECONDS);
+      _log.info(SCHEDULED_PERIODIC_REFRESH_MSG, refreshPeriodMs);
+    }
   }
 
   protected synchronized void createEventThread() {
@@ -468,6 +516,23 @@ public class Coordinator implements ZkAdapter.ZkAdapterListener, MetricsAware {
     return _adapter.getInstanceName();
   }
 
+  /**
+   * Set the {@link DatastreamLifecycleListener} notified of datastream lifecycle transitions. Optional;
+   * when not set (or set to {@code null}), lifecycle notifications are a no-op. Typically invoked once
+   * during server bootstrap.
+   * @param listener the listener to notify, or {@code null} to disable notifications
+   */
+  public void setDatastreamLifecycleListener(DatastreamLifecycleListener listener) {
+    _datastreamLifecycleListener = listener == null ? (eventType, datastream) -> { } : listener;
+  }
+
+  /**
+   * @return the configured {@link DatastreamLifecycleListener}; never {@code null} (a no-op by default)
+   */
+  public DatastreamLifecycleListener getDatastreamLifecycleListener() {
+    return _datastreamLifecycleListener;
+  }
+
   public Collection<DatastreamTask> getDatastreamTasks() {
     return _assignedDatastreamTasks.values();
   }
@@ -537,14 +602,11 @@ public class Coordinator implements ZkAdapter.ZkAdapterListener, MetricsAware {
     }
 
     if (isThroughputViolatingTopicsHandlingEnabled()) {
-      _log.info(
-          "Populating the datastream violating topics to host level cache from the datastream objects on the update trigger");
+      _log.info(POPULATE_VIOLATING_TOPICS_MSG, TRIGGER_UPDATE);
       try {
         populateThroughputViolatingTopicsMap(datastreamGroups);
       } catch (Exception exception) {
-        _log.error(
-            "Received an exception while populating the datastream violating topics to host level cache from the "
-                + "datastream objects on the update trigger", exception);
+        _log.error(POPULATE_VIOLATING_TOPICS_EXCEPTION_MSG, TRIGGER_UPDATE, exception);
       }
     }
     queueHandleAssignmentOrDatastreamChangeEvent(CoordinatorEvent.createHandleDatastreamChangeEvent(), true);
@@ -554,31 +616,30 @@ public class Coordinator implements ZkAdapter.ZkAdapterListener, MetricsAware {
   // This helper function populates the violations to local cache from the datastream metadata on every update call.
   // Also note that updates to this local cache follows the behavior of replace-all, and not incremental.
   private void populateThroughputViolatingTopicsMap(List<DatastreamGroup> datastreamGroups) {
+    // Build into a local map first so a mid-iteration exception leaves the live map untouched.
+    Map<String, Set<String>> next = new HashMap<>();
+    datastreamGroups.forEach(datastreamGroup -> datastreamGroup.getDatastreams().forEach(datastream -> {
+      if (!Objects.requireNonNull(datastream.getMetadata()).containsKey(THROUGHPUT_VIOLATING_TOPICS)) {
+        return;
+      }
+      String commaSeparatedViolatingTopics = datastream.getMetadata().get(THROUGHPUT_VIOLATING_TOPICS);
+      String[] violatingTopics = Arrays.stream(commaSeparatedViolatingTopics.split(","))
+          .map(String::trim)
+          .filter(s -> !s.isEmpty())
+          .toArray(String[]::new);
+
+      if (violatingTopics.length > 0) {
+        next.put(datastream.getName(), new HashSet<>(Arrays.asList(violatingTopics)));
+        _log.info("For datastream {}, Successfully reported throughput violating topics : {}", datastream.getName(),
+            violatingTopics);
+      }
+      _metrics.registerOrSetKeyedGauge(datastream.getName(),
+          CoordinatorMetrics.NUM_THROUGHPUT_VIOLATING_TOPICS_PER_DATASTREAM, () -> violatingTopics.length);
+    }));
     _throughputViolatingTopicsMapWriteLock.lock();
     try {
-      // clearing the cache as we would only maintain the latest reported information everytime.
       _throughputViolatingTopicsMap.clear();
-
-      // fetching new violations from the datastream object.
-      datastreamGroups.forEach(datastreamGroup -> datastreamGroup.getDatastreams().forEach(datastream -> {
-        if (!Objects.requireNonNull(datastream.getMetadata()).containsKey(THROUGHPUT_VIOLATING_TOPICS)) {
-          // if the throughput violating metadata field does not exist, we skip handling logic and reporting metrics
-          return;
-        }
-        // parse csv formatted violations metadata-string for every datastream
-        String commaSeparatedViolatingTopics = datastream.getMetadata().get(THROUGHPUT_VIOLATING_TOPICS);
-        String[] violatingTopics = Arrays.stream(commaSeparatedViolatingTopics.split(","))
-            .filter(s -> !s.trim().isEmpty())
-            .toArray(String[]::new);
-
-        if (violatingTopics.length > 0) {
-          _throughputViolatingTopicsMap.put(datastream.getName(), new HashSet<>(Arrays.asList(violatingTopics)));
-          _log.info("For datastream {}, Successfully reported throughput violating topics : {}", datastream.getName(),
-              violatingTopics);
-        }
-        _metrics.registerOrSetKeyedGauge(datastream.getName(),
-            CoordinatorMetrics.NUM_THROUGHPUT_VIOLATING_TOPICS_PER_DATASTREAM, () -> violatingTopics.length);
-      }));
+      _throughputViolatingTopicsMap.putAll(next);
     } finally {
       _throughputViolatingTopicsMapWriteLock.unlock();
     }
@@ -600,11 +661,30 @@ public class Coordinator implements ZkAdapter.ZkAdapterListener, MetricsAware {
     }
   }
 
+  // Test-only hook to simulate a stale/emptied host-level cache (e.g. after a missed or failed rebuild),
+  // used to verify that the periodic refresh rebuilds it from the current assignment.
+  @VisibleForTesting
+  void clearThroughputViolatingTopicsMapForTesting() {
+    _throughputViolatingTopicsMapWriteLock.lock();
+    try {
+      _throughputViolatingTopicsMap.clear();
+    } finally {
+      _throughputViolatingTopicsMapWriteLock.unlock();
+    }
+  }
+
   // This feature enables handling the management of throughput violating topics.
   // Latency metrics and SLAs would be reported separately for these topics if their
   // per partition throughput is not within brooklin's permissible bounds.
   public boolean isThroughputViolatingTopicsHandlingEnabled() {
     return _config.getEnableThroughputViolatingTopicsHandling();
+  }
+
+  // Periodic rebuild of the throughput-violating topics cache is active only when the feature is enabled
+  // AND the dedicated periodic-refresh toggle has not been turned off via config. When off, the cache is
+  // rebuilt only on assignment / datastream-update events.
+  public boolean isThroughputViolatingTopicsPeriodicRefreshEnabled() {
+    return isThroughputViolatingTopicsHandlingEnabled() && _config.getEnableThroughputViolatingTopicsPeriodicRefresh();
   }
 
   /**
@@ -743,25 +823,64 @@ public class Coordinator implements ZkAdapter.ZkAdapterListener, MetricsAware {
   @Override
   public void onAssignmentChange() {
     _log.info("Coordinator::onAssignmentChange is called");
-    queueHandleAssignmentOrDatastreamChangeEvent(CoordinatorEvent.createHandleAssignmentChangeEvent(), true);
 
+    // Rebuild the throughput-violating topics host-level cache BEFORE queuing the async task-start event.
+    // Queuing first opens a race: a newly started producer could emit before its topic is
+    // present in the map, misrouting its events to the normal-SLA path. This mirrors onDatastreamUpdate,
+    // which also populates before queuing.
     if (isThroughputViolatingTopicsHandlingEnabled()) {
       try {
-        // On creating a datastream if the metadata contains any throughput violating topics, we populate the host level cache
-        List<DatastreamGroup> datastreamGroups = _adapter.getInstanceAssignment(_adapter.getInstanceName())
-            .stream()
-            .map(task -> new DatastreamGroup(getDatastreamTask(task).getDatastreams()))
-            .collect(Collectors.toList());
-        _log.info(
-            "Populating the datastream violating topics to host level cache from the datastream objects on the create trigger");
-        populateThroughputViolatingTopicsMap(datastreamGroups);
+        refreshThroughputViolatingTopicsMap(TRIGGER_CREATE);
       } catch (Exception exception) {
-        _log.error(
-            "Received an exception while populating the datastream violating topics to host level cache from the "
-                + "datastream objects on the create trigger", exception);
+        _log.error(POPULATE_VIOLATING_TOPICS_EXCEPTION_MSG, TRIGGER_CREATE, exception);
       }
     }
+
+    queueHandleAssignmentOrDatastreamChangeEvent(CoordinatorEvent.createHandleAssignmentChangeEvent(), true);
+
     _log.info("Coordinator::onAssignmentChange completed successfully");
+  }
+
+  // Rebuilds the throughput-violating topics host-level cache from the current instance assignment.
+  // Shared by onAssignmentChange (create trigger) and the periodic refresh, so map freshness is
+  // decoupled from rebalance timing. Rebuild uses replace-all semantics via populateThroughputViolatingTopicsMap.
+  //
+  // Observability: a task that cannot be resolved (e.g. its ZNode disappeared mid-rebalance so
+  // getDatastreamTask returns null) is silently omitted from the replace-all rebuild; we WARN and count
+  // it so partial rebuilds are detectable. A non-empty assignment that yields no datastream groups
+  // would clear the cache to empty, so we WARN on that too.
+  private void refreshThroughputViolatingTopicsMap(String trigger) {
+    List<String> assignment = _adapter.getInstanceAssignment(_adapter.getInstanceName());
+    List<DatastreamGroup> datastreamGroups = new ArrayList<>();
+    int droppedTasks = 0;
+    for (String taskName : assignment) {
+      DatastreamTask task = getDatastreamTask(taskName);
+      if (task == null) {
+        droppedTasks++;
+        _log.warn(DROP_UNRESOLVED_TASK_MSG, taskName, trigger);
+        continue;
+      }
+      datastreamGroups.add(new DatastreamGroup(task.getDatastreams()));
+    }
+
+    if (!assignment.isEmpty() && datastreamGroups.isEmpty()) {
+      _log.warn(EMPTY_REBUILD_MSG, trigger, assignment.size());
+    } else if (droppedTasks > 0) {
+      _log.warn(PARTIAL_REBUILD_MSG, trigger, droppedTasks, assignment.size());
+    }
+
+    _log.info(POPULATE_VIOLATING_TOPICS_MSG, trigger);
+    populateThroughputViolatingTopicsMap(datastreamGroups);
+  }
+
+  // Wraps refreshThroughputViolatingTopicsMap for the scheduled executor: any thrown exception must be
+  // swallowed here, otherwise scheduleAtFixedRate would silently cancel all future refreshes.
+  private void runScheduledThroughputViolatingTopicsRefresh() {
+    try {
+      refreshThroughputViolatingTopicsMap(TRIGGER_PERIODIC_REFRESH);
+    } catch (Exception exception) {
+      _log.error(POPULATE_VIOLATING_TOPICS_EXCEPTION_MSG, TRIGGER_PERIODIC_REFRESH, exception);
+    }
   }
 
   private int getAssignmentTaskCount(Map<String, List<DatastreamTask>> assignment) {
@@ -792,8 +911,8 @@ public class Coordinator implements ZkAdapter.ZkAdapterListener, MetricsAware {
 
     if (queueEvent) {
       _log.warn("Queuing onAssignmentChange event");
-      CoordinatorEvent event = isDatastreamUpdate ? CoordinatorEvent.createHandleDatastreamChangeEvent() :
-          CoordinatorEvent.createHandleAssignmentChangeEvent();
+      CoordinatorEvent event = isDatastreamUpdate ? CoordinatorEvent.createHandleDatastreamChangeEvent()
+          : CoordinatorEvent.createHandleAssignmentChangeEvent();
       queueHandleAssignmentOrDatastreamChangeEvent(event, false);
     }
   }
@@ -1089,8 +1208,8 @@ public class Coordinator implements ZkAdapter.ZkAdapterListener, MetricsAware {
         if (retryAndSaveError) {
           err += " Queuing up a new onAssignmentChange event for retry.";
           _eventQueue.put(CoordinatorEvent.createHandleInstanceErrorEvent(ExceptionUtils.getRootCauseMessage(ex)));
-          CoordinatorEvent event = isDatastreamUpdate ? CoordinatorEvent.createHandleDatastreamChangeEvent() :
-              CoordinatorEvent.createHandleAssignmentChangeEvent();
+          CoordinatorEvent event = isDatastreamUpdate ? CoordinatorEvent.createHandleDatastreamChangeEvent()
+              : CoordinatorEvent.createHandleAssignmentChangeEvent();
           queueHandleAssignmentOrDatastreamChangeEvent(event, false);
         }
         _log.warn(err, ex);
@@ -1142,8 +1261,8 @@ public class Coordinator implements ZkAdapter.ZkAdapterListener, MetricsAware {
     boolean customCheckpointing = _connectors.get(task.getConnectorType()).isCustomCheckpointing();
 
     Datastream datastream = task.getDatastreams().get(0);
-    if (datastream.hasMetadata() &&
-        Objects.requireNonNull(datastream.getMetadata()).containsKey(DatastreamMetadataConstants.CUSTOM_CHECKPOINT)) {
+    if (datastream.hasMetadata()
+        && Objects.requireNonNull(datastream.getMetadata()).containsKey(DatastreamMetadataConstants.CUSTOM_CHECKPOINT)) {
       customCheckpointing = Boolean.parseBoolean(
           datastream.getMetadata().get(DatastreamMetadataConstants.CUSTOM_CHECKPOINT));
       _log.info(String.format("Custom checkpointing overridden by metadata to be: %b for datastream: %s",
@@ -1344,6 +1463,8 @@ public class Coordinator implements ZkAdapter.ZkAdapterListener, MetricsAware {
             _log.warn("Failed to update datastream: {} after initializing. This datastream will not be scheduled for "
                 + "producing events ", ds.getName());
             shouldRetry = true;
+          } else {
+            recordStreamProvisioningTime(ds);
           }
         } catch (Exception e) {
           _log.warn("Failed to update the destination of new datastream {}", ds, e);
@@ -1375,6 +1496,61 @@ public class Coordinator implements ZkAdapter.ZkAdapterListener, MetricsAware {
 
     _eventQueue.put(CoordinatorEvent.createLeaderDoAssignmentEvent(false));
     _log.info("END: Coordinator::handleDatastreamAddOrDelete.");
+  }
+
+  /**
+   * Records the time from {@code system.creation.ms} to the {@code INITIALIZING -> READY}
+   * transition for a newly created datastream. Updates the {@code streamProvisioningTimeMs} histogram and the
+   * provisioning SLO counters: {@code numStreamsProvisioned} (total) plus exactly one of
+   * {@code numStreamsProvisionedWithinSla} / {@code numStreamsProvisionedOutsideSla} depending on
+   * whether the duration exceeds {@link CoordinatorConfig#getProvisioningSlaThresholdMs()}.
+   */
+  private void recordStreamProvisioningTime(Datastream ds) {
+    String creationMsStr = Objects.requireNonNull(ds.getMetadata()).get(CREATION_MS);
+    if (creationMsStr == null) {
+      return;
+    }
+    try {
+      long creationTimeMs = System.currentTimeMillis() - Long.parseLong(creationMsStr);
+      long createValidationTimeMs = getCreateValidationTimeMs(ds);
+      // Total stream provisioning time is the creation time plus the create-validation time.
+      long streamProvisioningTimeMs = creationTimeMs + createValidationTimeMs;
+
+      _log.info("Stream provisioning time for Datastream {} - {} ms (creation {} ms + create-validation {} ms)",
+          ds.getName(), streamProvisioningTimeMs, creationTimeMs, createValidationTimeMs);
+      if (streamProvisioningTimeMs >= 0) {
+        _metrics.updateStreamProvisioningTimeHistogram(streamProvisioningTimeMs);
+        // Emit the SLO counters atomically: the total provisioned and exactly one of within/outside SLA.
+        // Each is emitted both as an aggregate and keyed by connector name
+        String connectorName = ds.getConnectorName();
+        _metrics.updateProvisioningSloCounter(CoordinatorMetrics.Counter.NUM_STREAMS_PROVISIONED, connectorName);
+        CoordinatorMetrics.Counter slaCounter = streamProvisioningTimeMs > _config.getProvisioningSlaThresholdMs()
+            ? CoordinatorMetrics.Counter.NUM_STREAMS_PROVISIONED_OUTSIDE_SLA
+            : CoordinatorMetrics.Counter.NUM_STREAMS_PROVISIONED_WITHIN_SLA;
+        _metrics.updateProvisioningSloCounter(slaCounter, connectorName);
+      }
+    } catch (NumberFormatException e) {
+      _log.warn("Invalid {} for datastream {}: {}", CREATION_MS, ds.getName(), creationMsStr);
+    }
+  }
+
+  /**
+   * Returns the create-validation time in milliseconds that is recorded in the
+   * datastream metadata under {@code system.createValidationTime.ms}, or 0 when the property is
+   * absent, not positive, or not a valid long.
+   */
+  @VisibleForTesting
+  static long getCreateValidationTimeMs(Datastream ds) {
+    String validationMsStr = Objects.requireNonNull(ds.getMetadata()).get(CREATE_VALIDATION_TIME_MS);
+    if (validationMsStr == null) {
+      return 0L;
+    }
+    try {
+      long createValidationTimeMs = Long.parseLong(validationMsStr);
+      return createValidationTimeMs > 0 ? createValidationTimeMs : 0L;
+    } catch (NumberFormatException e) {
+      return 0L;
+    }
   }
 
   private void hardDeleteDatastream(Datastream ds, List<Datastream> activeStreams) {
@@ -1595,8 +1771,8 @@ public class Coordinator implements ZkAdapter.ZkAdapterListener, MetricsAware {
         Thread.currentThread().getName(), streamNames);
     // Poll the zookeeper to ensure that hosts claimed assignment tokens for stopping streams
     Set<String> failedStreams = Collections.emptySet();
-    if (_config.getEnableAssignmentTokens() &&
-        !PollUtils.poll(() -> _adapter.getNumUnclaimedTokensForDatastreams(stoppingDatastreamGroups) == 0,
+    if (_config.getEnableAssignmentTokens()
+        && !PollUtils.poll(() -> _adapter.getNumUnclaimedTokensForDatastreams(stoppingDatastreamGroups) == 0,
             STOP_PROPAGATION_RETRY_MS, _config.getStopPropagationTimeoutMs())) {
       Map<String, List<AssignmentToken>> unclaimedTokens =
           _adapter.getUnclaimedAssignmentTokensForDatastreams(stoppingDatastreamGroups);
@@ -1611,8 +1787,8 @@ public class Coordinator implements ZkAdapter.ZkAdapterListener, MetricsAware {
             _config.getStopPropagationTimeoutMs(), failedStreams, hosts);
         _metrics.updateMeter(CoordinatorMetrics.Meter.NUM_FAILED_STOPS, failedStreams.size());
       } else if (!failedStreams.isEmpty()) {
-        _log.warn("Stop may have failed to propagate within {}ms for streams: {}. The newly elected leader was " +
-                "expecting the hosts {} to claim tokens but they didn't",
+        _log.warn("Stop may have failed to propagate within {}ms for streams: {}. The newly elected leader was "
+                + "expecting the hosts {} to claim tokens but they didn't",
             _config.getStopPropagationTimeoutMs(), failedStreams, hosts);
       }
       revokeUnclaimedAssignmentTokens(unclaimedTokens, stoppingDatastreamGroups);
@@ -1735,8 +1911,8 @@ public class Coordinator implements ZkAdapter.ZkAdapterListener, MetricsAware {
           DatastreamGroupPartitionsMetadata subscribes = connectorInstance.getDatastreamPartitions()
               .get(toProcessDatastream.getName())
               .orElseThrow(() ->
-                  new DatastreamTransientException("Subscribed partition is not ready yet for datastream " +
-                      toProcessDatastream.getName()));
+                  new DatastreamTransientException("Subscribed partition is not ready yet for datastream "
+                      + toProcessDatastream.getName()));
 
           assignmentByInstance = strategy.assignPartitions(assignmentByInstance, subscribes);
         } else {
@@ -2439,7 +2615,7 @@ public class Coordinator implements ZkAdapter.ZkAdapterListener, MetricsAware {
     private final List<BrooklinMetricInfo> _metricInfos;
     private final DynamicMetricsManager _dynamicMetricsManager;
 
-    public CoordinatorMetrics(Coordinator coordinator) {
+    CoordinatorMetrics(Coordinator coordinator) {
       _coordinator = coordinator;
       _metricInfos = new ArrayList<>();
       _dynamicMetricsManager = DynamicMetricsManager.getInstance();
@@ -2450,6 +2626,8 @@ public class Coordinator implements ZkAdapter.ZkAdapterListener, MetricsAware {
       registerKeyedMeterMetrics();
       registerGaugeMetrics();
       registerCounterMetrics();
+      registerKeyedCounterMetrics();
+      registerHistogramMetrics();
     }
 
     public void addMetricInfos(MetricsAware metricsAware) {
@@ -2492,6 +2670,21 @@ public class Coordinator implements ZkAdapter.ZkAdapterListener, MetricsAware {
 
     public void updateCounter(Counter metric, int value) {
       _dynamicMetricsManager.createOrUpdateCounter(MODULE, metric.getName(), value);
+    }
+
+    // Increments a provisioning SLO counter both as an aggregate (across all connectors) and, when the
+    // connector name is known, keyed by connector. The keyed series enables a per-connector SLO and
+    // per-connector miss breakdown.
+    public void updateProvisioningSloCounter(Counter metric, String connectorName) {
+      _dynamicMetricsManager.createOrUpdateCounter(MODULE, metric.getName(), 1);
+      if (connectorName != null && !connectorName.isEmpty()) {
+        _dynamicMetricsManager.createOrUpdateCounter(MODULE, connectorName, metric.getName(), 1);
+      }
+    }
+
+    public void updateStreamProvisioningTimeHistogram(long valueMs) {
+      _dynamicMetricsManager.createOrUpdateSlidingWindowHistogram(MODULE, null, STREAM_PROVISIONING_TIME_MS,
+          STREAM_PROVISIONING_TIME_HISTOGRAM_WINDOW_MS, valueMs);
     }
 
     public static KeyedMeter getKeyedMeter(EventType eventType) {
@@ -2580,6 +2773,31 @@ public class Coordinator implements ZkAdapter.ZkAdapterListener, MetricsAware {
     private void registerCounterMetrics() {
       // These metrics are eagerly created
       Arrays.stream(Counter.values()).forEach(this::registerCounter);
+    }
+
+    private void registerKeyedCounterMetrics() {
+      // The per-connector provisioning SLO counters are created lazily on first update via the keyed
+      // createOrUpdateCounter (key = connector name). Register regex-based BrooklinCounterInfo objects so
+      // the external metrics bridge picks up the Coordinator.<connectorName>.<counter> series for each
+      // connector. The aggregate (unkeyed) counters are covered separately by registerCounter.
+      String prefix = _coordinator.getDynamicMetricPrefixRegex();
+      _metricInfos.add(new BrooklinCounterInfo(prefix + Counter.NUM_STREAMS_PROVISIONED.getName()));
+      _metricInfos.add(new BrooklinCounterInfo(prefix + Counter.NUM_STREAMS_PROVISIONED_WITHIN_SLA.getName()));
+      _metricInfos.add(new BrooklinCounterInfo(prefix + Counter.NUM_STREAMS_PROVISIONED_OUTSIDE_SLA.getName()));
+    }
+
+    private void registerHistogramMetrics() {
+      // The metric is created lazily on first update via createOrUpdateSlidingWindowHistogram.
+      // Registering the BrooklinHistogramInfo here is required for the external metrics bridge
+      // to pick up the metric name.
+      _metricInfos.add(new BrooklinHistogramInfo(_coordinator.buildMetricName(MODULE, STREAM_PROVISIONING_TIME_MS),
+          Optional.of(Arrays.asList(
+              BrooklinHistogramInfo.COUNT,
+              BrooklinHistogramInfo.MAX,
+              BrooklinHistogramInfo.MEAN,
+              BrooklinHistogramInfo.PERCENTILE_50,
+              BrooklinHistogramInfo.PERCENTILE_95,
+              BrooklinHistogramInfo.PERCENTILE_99))));
     }
 
     private void registerMeter(Meter metric) {
@@ -2685,7 +2903,11 @@ public class Coordinator implements ZkAdapter.ZkAdapterListener, MetricsAware {
      * Coordinator metrics of type {@link com.codahale.metrics.Counter}
      */
     public enum Counter {
-      NUM_HEARTBEATS("numHeartbeats");
+      NUM_HEARTBEATS("numHeartbeats"),
+      // Provisioning SLO counters.
+      NUM_STREAMS_PROVISIONED("numStreamsProvisioned"),
+      NUM_STREAMS_PROVISIONED_WITHIN_SLA("numStreamsProvisionedWithinSla"),
+      NUM_STREAMS_PROVISIONED_OUTSIDE_SLA("numStreamsProvisionedOutsideSla");
 
       private final String _name;
 

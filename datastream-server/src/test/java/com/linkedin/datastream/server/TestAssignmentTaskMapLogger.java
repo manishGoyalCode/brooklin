@@ -10,7 +10,6 @@ import java.util.Map;
 import java.util.Set;
 
 import org.mockito.Mockito;
-
 import org.slf4j.Logger;
 import org.testng.annotations.Test;
 
@@ -138,7 +137,10 @@ public class TestAssignmentTaskMapLogger {
    */
   private String createCustomSizeString(double size) {
     StringBuilder sb = new StringBuilder();
-    for (int i = 0; i < size; i++) {
+    // Convert the (double) target size to an int up front; comparing the int loop counter directly
+    // against a double widens the counter on every iteration and can lose precision for large sizes.
+    int length = (int) size;
+    for (int i = 0; i < length; i++) {
       sb.append('A');
     }
     return sb.toString();
